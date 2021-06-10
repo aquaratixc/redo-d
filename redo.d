@@ -20,8 +20,7 @@
 ##% ldc2 -betterC -release -Os -boundscheck=off redo.d
 ##% strip -s redo
 */
-
-import core.stdc.inttypes; // for remove
+import core.stdc.errno;
 import core.stdc.limits;
 import core.stdc.stdio;
 import core.stdc.stdarg;
@@ -29,12 +28,20 @@ import core.stdc.stdlib;
 import core.stdc.string;
 
 
-
 import core.sys.posix.fcntl;
 import core.sys.posix.sys.stat;
 import core.sys.posix.stdio : fopen;
 import core.sys.posix.stdlib;
 import core.sys.posix.unistd;
+//import core.sys.posix.sys.wait : waitpid;
+
+extern(C) nothrow @nogc int dprintf(int fd, scope const char* format, ...);
+extern(C) nothrow @nogc int vdprintf(int fd, scope const char* format, ...);
+extern(C) nothrow @nogc int openat(int dirfd, scope const char *pathname, int flags);
+//extern(C) nothrow @nogc pid_t waitpid(pid_t pid, int *stat_loc, int options);
+
+enum O_DIRECTORY =  0x00200000;
+enum O_CLOEXEC = 0x00200000;
 
 
 struct sha256 {
@@ -188,7 +195,7 @@ int kflag, jflag, xflag, fflag, sflag;
 
 static void redo_ifcreate(int fd, char *target)
 {
-	//dprintf(fd, "-%s\n", target);
+	dprintf(fd, "-%s\n", target);
 }
 
 extern(C) static char* check_dofile(const char *fmt, ...)
@@ -332,8 +339,7 @@ static char* datefile(int fd)
 
 static int keepdir()
 {
-	//int fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	int fd = open(".", O_RDONLY);
+	int fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (fd < 0) {
 		perror("dir open");
 		printf("test");
@@ -348,9 +354,7 @@ static char* targetchdir(char *target)
 	if (base) {
 		int fd;
 		*base = 0;
-		// wtf this ???
-		//fd = openat(dir_fd, target, O_RDONLY | O_DIRECTORY);
-		//fd = openat(dir_fd, target, O_RDONLY | 0x010000); // ditto 
+		fd = openat(dir_fd, target, O_RDONLY | O_DIRECTORY);
 		if (fd < 0) {
 			perror("openat dir");
 			exit(111);
@@ -430,8 +434,7 @@ static int check_deps(char* target)
 					ok = 0;
 				break;
 			case '=':  
-				// wtf this ???
-				//fd = open(filename, O_RDONLY);
+				fd = open(filename, O_RDONLY);
 				if (fd < 0) {
 					ok = 0;
 				} else {
@@ -465,6 +468,54 @@ static int check_deps(char* target)
 	return ok;
 }
 
+void vacate(int implicit)
+{
+	if (implicit)
+		implicit_jobs++;
+	else
+		write(poolwr_fd, "\0".ptr, 1);
+}
+
+struct job {
+	job* next;
+	pid_t pid;
+	int lock_fd;
+	char* target, temp_depfile, temp_target;
+	int implicit;
+};
+
+job* jobhead;
+
+static void insert_job(job* _job)
+{
+	_job.next = jobhead;
+	jobhead = _job;
+}
+
+static void remove_job(job* job_)
+{
+	if (jobhead == job_)
+		jobhead = jobhead.next;
+	else {
+		job* j = jobhead;
+		while (j.next != job_)
+			j = j.next;
+		j.next = j.next.next;
+	}
+}
+
+static job* find_job(pid_t pid)
+{
+	job* j;
+
+	for (j = jobhead; j; j = j.next) {
+		if (j.pid == pid)
+			return j;
+	}
+
+	return cast(job*) 0;
+}
+
 char[PATH_MAX] uprel;
 
 void compute_uprel()
@@ -487,23 +538,39 @@ static int write_dep(int dep_fd, char *file)
 	int fd = open(file, O_RDONLY);
 	if (fd < 0)
 		return 0;
-	// wtf this ???
-	// vdprintf(dep_fd, "=%s %s %s%s\n", hashfile(fd), datefile(fd), (*file == '/' ? "" : uprel), file);
+	vdprintf(dep_fd, "=%s %s %s%s\n", hashfile(fd), datefile(fd), (*file == '/' ? "" : uprel.ptr), file);
 	close(fd);
 	return 0;
 }
 
-//extern(C) int fdprintf(int fd, char *fmt, ...) {
-    //va_list ap;
-    //FILE *f = fdopen(fd);
-    //int rc;
+int new_waitjob(int lock_fd, int implicit)
+{
+	pid_t pid;
 
-    //va_start(ap, &fmt);
-    //rc = vfprintf(f, fmt, ap);
-    //fclose(f);
-    //va_end(ap);
-    //return rc;
-//}
+	pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		vacate(implicit);
+		exit(-1);
+	} else if (pid == 0) { // child
+		lockf(lock_fd, F_LOCK, 0);
+		close(lock_fd);
+		exit(0);
+	} else {
+		job* _job = cast(job*) malloc((job*).sizeof);
+		if (!_job)
+			exit(-1);
+		_job.target = cast(char*) 0;
+		_job.pid = pid;
+		_job.lock_fd = lock_fd;
+		_job.implicit = implicit;
+
+		insert_job(_job);
+	}
+
+	return 0;
+}
+
 
 // dofile doesn't contain /
 // target can contain /
@@ -531,6 +598,276 @@ static char* redo_basename(char *dofile, char *target)
 	return buf.ptr;
 }
 
+static void run_script(char *target, int implicit)
+{
+	char[] temp_depfile = cast(char[]) ".depend.XXXXXX";
+	char[] temp_target_base = cast(char[]) ".target.XXXXXX";
+	char[PATH_MAX] temp_target, rel_target, cwd;
+	char* orig_target = target;
+	int old_dep_fd = dep_fd;
+	int target_fd;
+	char* dofile, dirprefix;
+	pid_t pid;
+
+	target = targetchdir(target);
+
+	dofile = find_dofile(target);
+	if (!dofile) {
+		fprintf(stderr, "no dofile for %s.\n", target);
+		exit(1);
+	}
+
+	int lock_fd = open(targetlock(target),
+	    O_WRONLY | O_TRUNC | O_CREAT, 0x1b6); // 0x1b6 (hex) == 0o666 (oct)
+	if (lockf(lock_fd, F_TLOCK, 0) < 0) {
+		if (errno == EAGAIN) {
+			fprintf(stderr, "redo: %s already building, waiting.\n",
+			    orig_target);
+			new_waitjob(lock_fd, implicit);
+			return;
+		} else {
+			perror("lockf");
+			exit(111);
+		}
+	}
+
+	dep_fd = mkstemp(temp_depfile.ptr);
+
+	target_fd = mkstemp(temp_target_base.ptr);
+
+	fprintf(stderr, "redo%*.*s %s # %s\n".ptr, level*2, level*2, " ".ptr, orig_target, dofile);
+	write_dep(dep_fd, dofile);
+
+	// .do files are called from the directory they reside in, we need to
+	// prefix the arguments with the path from the dofile to the target
+	getcwd(cwd.ptr, cwd.sizeof);
+	dirprefix = strchr(cwd.ptr, '\0');
+	dofile += 2;  // find_dofile starts with ./ always
+	while (strncmp(dofile, "../", 3) == 0) {
+		chdir("..");
+		dofile += 3;
+		while (*--dirprefix != '/') {}
+	}
+	if (*dirprefix)
+		dirprefix++;
+
+	snprintf(temp_target.ptr, temp_target.sizeof,
+	    "%s%s%s".ptr, dirprefix, (*dirprefix ? cast(char*) "/" : cast(char*) ""), temp_target_base.ptr);
+	snprintf(rel_target.ptr, rel_target.sizeof,
+	    "%s%s%s".ptr, dirprefix, (*dirprefix ? cast(char*) "/" : cast(char*) ""), target);
+
+	setenv("REDO_DIRPREFIX", dirprefix, 1);
+
+	pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		vacate(implicit);
+		exit(-1);
+	} else if (pid == 0) { // child
+/*
+djb-style default.o.do:
+   $1	   foo.o
+   $2	   foo
+   $3	   whatever.tmp
+
+   $1	   all
+   $2	   all (!!)
+   $3	   whatever.tmp
+
+   $1	   subdir/foo.o
+   $2	   subdir/foo
+   $3	   subdir/whatever.tmp
+*/
+		char *basename = redo_basename(dofile, rel_target.ptr);
+
+		if (old_dep_fd > 0)
+			close(old_dep_fd);
+		close(lock_fd);
+		setenvfd("REDO_DEP_FD", dep_fd);
+		setenvfd("REDO_LEVEL", level + 1);
+		if (sflag > 0)
+			dup2(target_fd, 1);
+		else
+			close(target_fd);
+
+		if (access(dofile, X_OK) != 0)   // run -x files with /bin/sh
+			execl("/bin/sh".ptr, "/bin/sh".ptr, xflag > 0 ? "-ex".ptr : "-e".ptr,
+			    dofile, rel_target.ptr, basename, temp_target.ptr, cast(char*) 0);
+		else
+			execl(dofile,
+			    dofile, rel_target.ptr, basename, temp_target.ptr, cast(char*) 0);
+		vacate(implicit);
+		exit(-1);
+	} else {
+		job* _job = cast(job*) malloc((job*).sizeof);
+		if (!_job)
+			exit(-1);
+
+		close(target_fd);
+		close(dep_fd);
+		dep_fd = old_dep_fd;
+
+		_job.pid = pid;
+		_job.lock_fd = lock_fd;
+		_job.target = orig_target;
+		_job.temp_depfile = strdup(temp_depfile.ptr);
+		_job.temp_target = strdup(temp_target_base.ptr);
+		_job.implicit = implicit;
+
+		insert_job(_job);
+	}
+}
+
+static int try_procure()
+{
+	if (implicit_jobs > 0) {
+		implicit_jobs--;
+		return 1;
+	} else {
+		if (poolrd_fd < 0)
+			return 0;
+
+		fcntl(poolrd_fd, F_SETFL, O_NONBLOCK);
+
+		char[1] buf;
+		return read(poolrd_fd, &buf, 1) > 0;
+	}
+}
+
+static int procure()
+{
+	if (implicit_jobs > 0) {
+		implicit_jobs--;
+		return 1;
+	} else {
+		fcntl(poolrd_fd, F_SETFL, 0);   // clear O_NONBLOCK
+
+		char[1] buf;
+		return read(poolrd_fd, &buf, 1) > 0;
+	}
+}
+
+void create_pool()
+{
+	poolrd_fd = envfd("REDO_RD_FD");
+	poolwr_fd = envfd("REDO_WR_FD");
+	if (poolrd_fd < 0 || poolwr_fd < 0) {
+		int jobs = envfd("JOBS");
+		if (jobs > 1) {
+			int i;
+			int[2] fds;
+			pipe(fds);
+			poolrd_fd = fds[0];
+			poolwr_fd = fds[1];
+
+			for (i = 0; i < jobs-1; i++)
+				vacate(0);
+
+			setenvfd("REDO_RD_FD", poolrd_fd);
+			setenvfd("REDO_WR_FD", poolwr_fd);
+		} else {
+			poolrd_fd = -1;
+			poolwr_fd = -1;
+		}
+	}
+}
+
+static void redo_ifchange(int targetc, char** targetv)
+{
+	pid_t pid;
+	int status;
+	job* _job;
+
+	int targeti = 0;
+
+	// XXX
+	char* skip = cast(char*) malloc(targetc * char.sizeof);
+    scope(exit) free(skip);
+
+	create_pool();
+
+	// check all targets whether needing rebuild
+	for (targeti = 0; targeti < targetc; targeti++)
+		skip[targeti] = cast(char) check_deps(targetv[targeti]);
+
+	targeti = 0;
+	while (1) {
+		int procured = 0;
+		if (targeti < targetc) {
+			char *target = targetv[targeti];
+
+			if (skip[targeti]) {
+				targeti++;
+				continue;
+			}
+
+			int implicit = implicit_jobs > 0;
+			if (try_procure()) {
+				procured = 1;
+				targeti++;
+				run_script(target, implicit);
+			}
+		}
+
+		pid = waitpid(-1, &status, procured ? WNOHANG : 0);
+
+		if (pid == 0)
+			continue;  // nohang
+
+		if (pid < 0) {
+			if (errno == ECHILD && targeti < targetc)
+				continue;   // no child yet???
+			else
+				break;   // no child left
+		}
+
+		if (WIFEXITED(status))
+			status = WEXITSTATUS(status);
+
+		_job = find_job(pid);
+
+		if (!_job) {
+			exit(-1);
+		}
+		remove_job(_job);
+
+		if (_job.target) {
+			if (status > 0) {
+				remove(_job.temp_depfile);
+				remove(_job.temp_target);
+			} else {
+				stat_t st;
+				char *target = targetchdir(_job.target);
+				char *depfile = targetdep(target);
+				int dfd;
+
+				dfd = open(_job.temp_depfile,
+				    O_WRONLY | O_APPEND);
+				if (stat(_job.temp_target, &st) == 0) {
+					rename(_job.temp_target, target);
+					write_dep(dfd, target);
+				} else {
+					remove(_job.temp_target);
+					redo_ifcreate(dfd, target);
+				}
+				close(dfd);
+
+				rename(_job.temp_depfile, depfile);
+				remove(targetlock(target));
+			}
+		}
+
+		close(_job.lock_fd);
+
+		vacate(_job.implicit);
+
+		if (kflag < 0 && status > 0) {
+			printf("failed with status %d\n", status);
+			exit(status);
+		}
+	}
+}
+
 static void record_deps(int targetc, char** targetv)
 {
 	int targeti = 0;
@@ -551,25 +888,6 @@ static void record_deps(int targetc, char** targetv)
 	}
 }
 
-
-//extern(C) void main(int argc, char*[] argv)
-//{
-	//// имя файла для опытов
-	//char* filename = cast(char*) "tcp_server.d";
-	//// хэш сюда
-	//char* hash, date;
-	//// открываем файл и сохраняем на него дескриптор
-    //int fd = open(filename, O_RDONLY);
-    //// получаем хэш
-    //hash = hashfile(fd);
-    //date = datefile(fd);
-    //// распечатать хэш
-    //printf("%s\n", hash);
-    //printf("%s\n", date);
-    //// закрыть файл
-    //close(fd);
-//}
-
 extern(C) int main(int argc, char** argv)
 {
 	char *program;
@@ -585,7 +903,9 @@ extern(C) int main(int argc, char** argv)
 		program++;
 	else
 		program = argv[0];
-
+		
+	//printf("argv = %s\n", argv[0]);
+		
 	while ((opt = getopt(argc, argv, "+kxfsj:C:")) != -1) {
 		switch (opt) {
 		case 'k':
@@ -623,10 +943,11 @@ extern(C) int main(int argc, char** argv)
 	sflag = envfd("REDO_STDOUT");
 
 	dir_fd = keepdir();
-
+	
 	if (strcmp(program, "redo") == 0) {
 		char[] all = cast(char[]) "all";
-		char** argv_def =  cast(char**) [ all ];
+		char** argv_def;
+		argv_def = cast(char**) all;
 
 		if (argc == 0) {
 			argc = 1;
@@ -634,18 +955,18 @@ extern(C) int main(int argc, char** argv)
 		}
 
 		fflag = 1;
-		//redo_ifchange(argc, argv);
-		//procure();
+		redo_ifchange(argc, argv);
+		procure();
 	} else if (strcmp(program, "redo-ifchange") == 0) {
 		compute_uprel();
-		//redo_ifchange(argc, argv);
+		redo_ifchange(argc, argv);
 		record_deps(argc, argv);
-		//procure();
+		procure();
 	} else if (strcmp(program, "redo-ifcreate") == 0) {
 		for (i = 0; i < argc; i++)
 			redo_ifcreate(dep_fd, argv[i]);
 	} else if (strcmp(program, "redo-always") == 0) {
-		//dprintf(dep_fd, "!\n");
+		dprintf(dep_fd, "!\n");
 	} else if (strcmp(program, "redo-hash") == 0) {
 		for (i = 0; i < argc; i++)
 			write_dep(1, argv[i]);
