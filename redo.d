@@ -33,16 +33,19 @@ import core.sys.posix.sys.stat;
 import core.sys.posix.stdio : fopen;
 import core.sys.posix.stdlib;
 import core.sys.posix.unistd;
-//import core.sys.posix.sys.wait : waitpid;
+
 
 extern(C) nothrow @nogc int dprintf(int fd, scope const char* format, ...);
 extern(C) nothrow @nogc int vdprintf(int fd, scope const char* format, ...);
 extern(C) nothrow @nogc int openat(int dirfd, scope const char *pathname, int flags);
-//extern(C) nothrow @nogc pid_t waitpid(pid_t pid, int *stat_loc, int options);
+
+pragma(inline, true);
+extern (D) int  WEXITSTATUS(int status)  { return ( status & 0xFF00 ) >> 8;   }
+extern (D) int __WTERMSIG( int status ) { return status & 0x7F; }
+extern (D) bool WIFEXITED( int status ) { return __WTERMSIG( status ) == 0;  }
 
 enum O_DIRECTORY =  0x00200000;
 enum O_CLOEXEC = 0x00200000;
-
 
 struct sha256 {
 	ulong len;    /* processed message length */
@@ -538,7 +541,7 @@ static int write_dep(int dep_fd, char *file)
 	int fd = open(file, O_RDONLY);
 	if (fd < 0)
 		return 0;
-	vdprintf(dep_fd, "=%s %s %s%s\n", hashfile(fd), datefile(fd), (*file == '/' ? "" : uprel.ptr), file);
+	vdprintf(dep_fd, "=%s %s %s%s\n", hashfile(fd), datefile(fd), (*file == '/' ? "".ptr : uprel.ptr), file);
 	close(fd);
 	return 0;
 }
@@ -619,6 +622,7 @@ static void run_script(char *target, int implicit)
 
 	int lock_fd = open(targetlock(target),
 	    O_WRONLY | O_TRUNC | O_CREAT, 0x1b6); // 0x1b6 (hex) == 0o666 (oct)
+	    printf("%s", target);
 	if (lockf(lock_fd, F_TLOCK, 0) < 0) {
 		if (errno == EAGAIN) {
 			fprintf(stderr, "redo: %s already building, waiting.\n",
@@ -785,10 +789,12 @@ static void redo_ifchange(int targetc, char** targetv)
     scope(exit) free(skip);
 
 	create_pool();
-
+	printf("No !!!");
 	// check all targets whether needing rebuild
 	for (targeti = 0; targeti < targetc; targeti++)
 		skip[targeti] = cast(char) check_deps(targetv[targeti]);
+		
+	
 
 	targeti = 0;
 	while (1) {
@@ -808,7 +814,7 @@ static void redo_ifchange(int targetc, char** targetv)
 				run_script(target, implicit);
 			}
 		}
-
+         
 		pid = waitpid(-1, &status, procured ? WNOHANG : 0);
 
 		if (pid == 0)
@@ -890,7 +896,7 @@ static void record_deps(int targetc, char** targetv)
 
 extern(C) int main(int argc, char** argv)
 {
-	char *program;
+	char* program;
 	int opt, i;
 
 	dep_fd = envfd("REDO_DEP_FD");
@@ -899,10 +905,12 @@ extern(C) int main(int argc, char** argv)
 	if (level < 0)
 		level = 0;
 
-	if ((program == strrchr(argv[0], '/')))
-		program++;
-	else
-		program = argv[0];
+	//if ((program == strrchr(argv[0], '/')))
+		//program++;
+	//else
+		//program = argv[0];
+		
+	program = argv[0];
 		
 	//printf("argv = %s\n", argv[0]);
 		
