@@ -39,7 +39,6 @@ extern(C) nothrow @nogc int dprintf(int fd, scope const char* format, ...);
 extern(C) nothrow @nogc int vdprintf(int fd, scope const char* format, ...);
 extern(C) nothrow @nogc int openat(int dirfd, scope const char *pathname, int flags);
 
-pragma(inline, true);
 extern (D) int  WEXITSTATUS(int status)  { return ( status & 0xFF00 ) >> 8;   }
 extern (D) int __WTERMSIG( int status ) { return status & 0x7F; }
 extern (D) bool WIFEXITED( int status ) { return __WTERMSIG( status ) == 0;  }
